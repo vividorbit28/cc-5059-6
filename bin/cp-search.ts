@@ -18,6 +18,13 @@ import { midiToName, parsePitch } from '../src/core/pitch.js';
 import { parseMelody } from '../src/core/plan.js';
 import { search, statsTable, sumPruned, type SearchResult } from '../src/core/search.js';
 import { buildExample, buildScoreFromParts, compareHistorySemantics } from '../src/core/examples.js';
+import {
+  crossBarVetoes,
+  defaultRosters,
+  partScoreText,
+  planRehearsal,
+  suspensionCompletion,
+} from '../src/core/rehearsal.js';
 import { renderScoreToWav } from '../src/audio/synth.js';
 
 interface CliOptions {
@@ -36,6 +43,7 @@ interface CliOptions {
   rulesOff: string[];
   rulesOn: string[];
   compare: boolean;
+  rehearsal: boolean;
 }
 
 function usage(): string {
@@ -55,6 +63,7 @@ function usage(): string {
   --max-solutions <n>   最多返回解数（默认 8）
   --history <policy>    carry | truncate（默认 carry）
   --compare-history     同时跑两种历史策略并比较解集
+  --rehearsal           用默认合唱编制导出分谱，并核对悬挂音的解决歌手
   --rules-off <list>    逗号分隔的规则 id，强制关闭
   --rules-on <list>     逗号分隔的规则 id，强制开启
   --json                输出完整 JSON（含每个解的逐音与违例）
@@ -175,6 +184,7 @@ async function main(): Promise<void> {
         'max-solutions': { type: 'string', default: '8' },
         history: { type: 'string', default: 'carry' },
         'compare-history': { type: 'boolean', default: false },
+        rehearsal: { type: 'boolean', default: false },
         'rules-off': { type: 'string', default: '' },
         'rules-on': { type: 'string', default: '' },
         json: { type: 'boolean', default: false },
@@ -303,6 +313,56 @@ async function main(): Promise<void> {
   if (values.out) {
     writeFileSync(values.out, text, 'utf8');
     console.log(`\n已写入 ${values.out}`);
+  }
+
+  if (values.rehearsal && res.solutions[0]) {
+    const sol = res.solutions[0];
+    const score = buildScoreFromParts(parsedCf.notes, sol.u1, sol.u2, {
+      key: keyPreset.key,
+      beatsPerMeasure: 4,
+      tempo: 84,
+    });
+    const ranges = {
+      cf: { low: score.voices.cf.low, high: score.voices.cf.high, name: '定旋律' },
+      u1: { low: rangeU1.low, high: rangeU1.high, name: DEFAULT_VOICES.u1.name },
+      u2: { low: rangeU2.low, high: rangeU2.high, name: DEFAULT_VOICES.u2.name },
+    };
+    const config = defaultRosters(ranges, 4);
+    const plan = planRehearsal(score, config, rules);
+    const vetoes = crossBarVetoes(score, config, rules);
+    const completions = suspensionCompletion(plan);
+    if (values.json) {
+      console.log(
+        JSON.stringify(
+          {
+            answers: completions,
+            breaths: plan.breaths,
+            swaps: plan.swaps,
+            anomalies: plan.anomalies,
+            vetoes,
+            partScore: partScoreText(plan, score),
+          },
+          null,
+          2,
+        ),
+      );
+    } else {
+      console.log('\n=== 分谱 ===');
+      console.log(partScoreText(plan, score));
+      if (completions.length > 0) {
+        console.log('=== 悬挂音由谁完成 ===');
+        for (const c of completions) {
+          console.log(
+            `  ${c.voice}: 延留 ${c.heldBy ?? '—'} → 解决 ${c.resolvedBy ?? '—'}` +
+              `${c.swappedAcrossBar ? '（跨小节换人）' : ''} ${c.singable ? '可唱' : '不可唱'}`,
+          );
+        }
+      }
+      if (vetoes.length > 0) {
+        console.log('=== 排练器反向否决 ===');
+        for (const v of vetoes) console.log(`  ${v.message}`);
+      }
+    }
   }
 
   if (values.wav) {

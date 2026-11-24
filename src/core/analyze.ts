@@ -10,7 +10,19 @@ import {
 } from './pitch.js';
 import type { Note, VoiceId } from './score.js';
 import type { CounterpointRules, HistoryPolicy } from './rules.js';
-import { EPS, feq, noteKey, quant, type EventPoint, type VoicePlan } from './plan.js';
+import { EPS, noteKey, type EventPoint, type VoicePlan } from './plan.js';
+import {
+  activeSlotIn,
+  lastPairBefore,
+  neighbourInVoice,
+  slicesBetween,
+  type PairSnapshot,
+  type Slice,
+} from './voiceOverlap.js';
+import { isDirectPerfect, isParallelPerfect } from './intervalRules.js';
+
+export { activeSlotIn, lastPairBefore, neighbourInVoice, slicesBetween };
+export type { PairSnapshot, Slice };
 
 export type Severity = 'error' | 'warning' | 'info';
 export type DissonanceKind =
@@ -64,30 +76,10 @@ export type RuleKey =
   | 'startPerfect'
   | 'endOnTonic'
   | 'endPerfect'
-  | 'range';
-
-export interface PairSnapshot {
-  lower: VoiceId;
-  upper: VoiceId;
-  lowerSlot: number;
-  upperSlot: number;
-  lowerPitch: number;
-  upperPitch: number;
-  simple: number;
-  perfect: boolean;
-  quality: 'perfect' | 'imperfect' | 'dissonant';
-  intervalLabel: string;
-  /** 该纵向关系的实际重叠区间。 */
-  from: number;
-  to: number;
-}
-
-export interface Slice {
-  from: number;
-  to: number;
-  active: Partial<Record<VoiceId, { slot: number; pitch: number }>>;
-  pairs: PairSnapshot[];
-}
+  | 'range'
+  | 'rehearsalRange'
+  | 'rehearsalBreath'
+  | 'rehearsalSwap';
 
 export interface Assignment {
   /** voice:slot -> pitch */
@@ -125,90 +117,6 @@ export function emptyAssignment(): Assignment {
 
 export function cloneAssignment(a: Assignment): Assignment {
   return { pitch: new Map(a.pitch) };
-}
-
-/** 返回 [t, next) 内的全部实际发声与两两音程。 */
-export function slicesBetween(
-  ctx: AnalysisContext,
-  a: Assignment,
-  from: number,
-  to: number,
-): Slice[] {
-  const breaks = new Set<number>([from, to]);
-  for (const id of ['cf', 'u1', 'u2'] as VoiceId[]) {
-    for (const s of ctx.plans[id].slots) {
-      if (s.end <= from + EPS || s.onset >= to - EPS) continue;
-      breaks.add(quant(Math.max(s.onset, from)));
-      breaks.add(quant(Math.min(s.end, to)));
-    }
-  }
-  const sorted = [...breaks].sort((x, y) => x - y);
-  const out: Slice[] = [];
-  for (let i = 0; i < sorted.length - 1; i++) {
-    const segFrom = sorted[i];
-    const segTo = sorted[i + 1];
-    if (segTo - segFrom <= EPS) continue;
-    const mid = (segFrom + segTo) / 2;
-    const active: Partial<Record<VoiceId, { slot: number; pitch: number }>> = {};
-    for (const id of ['cf', 'u1', 'u2'] as VoiceId[]) {
-      const slots = ctx.plans[id].slots;
-      for (let k = 0; k < slots.length; k++) {
-        const sl = slots[k];
-        if (sl.onset > mid + EPS || sl.end <= mid + EPS) continue;
-        const p = a.pitch.get(noteKey(id, k));
-        if (p === undefined) continue;
-        active[id] = { slot: k, pitch: p };
-        break;
-      }
-    }
-    if (Object.keys(active).length < 2) {
-      out.push({ from: segFrom, to: segTo, active, pairs: [] });
-      continue;
-    }
-    const ids = (Object.keys(active) as VoiceId[]).sort(
-      (x, y) => active[x]!.pitch - active[y]!.pitch,
-    );
-    const pairs: PairSnapshot[] = [];
-    for (let x = 0; x < ids.length; x++) {
-      for (let y = x + 1; y < ids.length; y++) {
-        const lo = active[ids[x]]!;
-        const hi = active[ids[y]]!;
-        const info = intervalInfo(lo.pitch, hi.pitch, ctx.rules.fourthConsonant);
-        pairs.push({
-          lower: ids[x],
-          upper: ids[y],
-          lowerSlot: lo.slot,
-          upperSlot: hi.slot,
-          lowerPitch: lo.pitch,
-          upperPitch: hi.pitch,
-          simple: info.simple,
-          perfect: isPerfectInterval(lo.pitch, hi.pitch, ctx.rules.fourthConsonant),
-          quality: info.quality,
-          intervalLabel: info.label,
-          from: segFrom,
-          to: segTo,
-        });
-      }
-    }
-    out.push({ from: segFrom, to: segTo, active, pairs });
-  }
-  return out;
-}
-
-/** 找到一个声部在 time 之前的相邻槽位及其音高。 */
-export function neighbourInVoice(
-  ctx: AnalysisContext,
-  a: Assignment,
-  voice: VoiceId,
-  slot: number,
-  dir: -1 | 1,
-): { slot: number; pitch: number; onset: number; end: number } | null {
-  const target = slot + dir;
-  const slots = ctx.plans[voice].slots;
-  if (target < 0 || target >= slots.length) return null;
-  const p = a.pitch.get(noteKey(voice, target));
-  if (p === undefined) return null;
-  return { slot: target, pitch: p, onset: slots[target].onset, end: slots[target].end };
 }
 
 /**
@@ -697,47 +605,37 @@ export function checkSlot(
       // 平行纯音程：比较前一个实际重叠段
       if (rules.forbidParallelPerfects && info.quality === 'perfect') {
         const prevPair = previousPair(ctx, a, pair, slice.from);
-        if (prevPair && prevPair.perfect) {
-          const sameKind = pair.simple === prevPair.simple;
-          const dLo = Math.sign(pair.lowerPitch - prevPair.lowerPitch);
-          const dHi = Math.sign(pair.upperPitch - prevPair.upperPitch);
-          if (sameKind && dLo !== 0 && dLo === dHi) {
-            push(
-              'forbidParallelPerfects',
-              '禁止平行五/八度',
-              'error',
-              slice.from,
-              [pair.lower, pair.upper],
-              `${who} 与前一重叠段 ${midiToName(prevPair.lowerPitch)} / ${midiToName(prevPair.upperPitch)} 构成平行${pair.simple === 7 ? '五度' : '八度/同度'}。`,
-              `两声部同向从${intervalInfo(prevPair.lowerPitch, prevPair.upperPitch, rules.fourthConsonant).label}进入${info.label}。`,
-              [
-                ...pairNotes,
-                { voice: prevPair.lower, index: prevPair.lowerSlot },
-                { voice: prevPair.upper, index: prevPair.upperSlot },
-              ],
-            );
-          }
+        if (prevPair && isParallelPerfect(prevPair, pair)) {
+          push(
+            'forbidParallelPerfects',
+            '禁止平行五/八度',
+            'error',
+            slice.from,
+            [pair.lower, pair.upper],
+            `${who} 与前一重叠段 ${midiToName(prevPair.lowerPitch)} / ${midiToName(prevPair.upperPitch)} 构成平行${pair.simple === 7 ? '五度' : '八度/同度'}。`,
+            `两声部同向从${intervalInfo(prevPair.lowerPitch, prevPair.upperPitch, rules.fourthConsonant).label}进入${info.label}。`,
+            [
+              ...pairNotes,
+              { voice: prevPair.lower, index: prevPair.lowerSlot },
+              { voice: prevPair.upper, index: prevPair.upperSlot },
+            ],
+          );
         }
       }
 
       if (rules.forbidDirectPerfects && info.quality === 'perfect') {
         const prevPair = previousPair(ctx, a, pair, slice.from);
-        if (prevPair) {
-          const dLo = Math.sign(pair.lowerPitch - prevPair.lowerPitch);
-          const dHi = Math.sign(pair.upperPitch - prevPair.upperPitch);
-          const upperLeap = Math.abs(pair.upperPitch - prevPair.upperPitch) >= 3;
-          if (dLo !== 0 && dLo === dHi && upperLeap) {
-            push(
-              'forbidDirectPerfects',
-              '禁止直接五/八度',
-              'error',
-              slice.from,
-              [pair.lower, pair.upper],
-              `${who} 由同向跳进进入纯音程（直接${pair.simple === 7 ? '五度' : '八度'}）。`,
-              '上方声部跳进且两声部同向进入纯音程。',
-              pairNotes,
-            );
-          }
+        if (prevPair && isDirectPerfect(prevPair, pair)) {
+          push(
+            'forbidDirectPerfects',
+            '禁止直接五/八度',
+            'error',
+            slice.from,
+            [pair.lower, pair.upper],
+            `${who} 由同向跳进进入纯音程（直接${pair.simple === 7 ? '五度' : '八度'}）。`,
+            '上方声部跳进且两声部同向进入纯音程。',
+            pairNotes,
+          );
         }
       }
 
@@ -782,20 +680,6 @@ export function checkSlot(
   return dedupe(out);
 }
 
-export function activeSlotIn(
-  ctx: AnalysisContext,
-  a: Assignment,
-  voice: VoiceId,
-  time: number,
-): number {
-  const slots = ctx.plans[voice].slots;
-  for (let i = 0; i < slots.length; i++) {
-    const s = slots[i];
-    if (s.onset <= time + EPS && s.end > time + EPS && a.pitch.has(noteKey(voice, i))) return i;
-  }
-  return 0;
-}
-
 /** 找到与给定 pair 同一对声部、在 from 之前最近的纵向片段。 */
 export function previousPair(
   ctx: AnalysisContext,
@@ -807,75 +691,6 @@ export function previousPair(
   if (!found) return null;
   if (ctx.historyPolicy === 'truncate' && found.to <= ctx.historyFloor + EPS) return null;
   return found;
-}
-
-function lastPairBefore(
-  ctx: AnalysisContext,
-  a: Assignment,
-  lo: VoiceId,
-  hi: VoiceId,
-  before: number,
-): PairSnapshot | null {
-  if (before <= EPS) return null;
-  // 取紧邻 before 的一小段，再逐步向前找有双声部的片段
-  const times = new Set<number>();
-  for (const id of [lo, hi]) {
-    for (const s of ctx.plans[id].slots) {
-      if (s.onset < before - EPS) times.add(quant(s.onset));
-      if (s.end < before - EPS) times.add(quant(s.end));
-    }
-  }
-  const sorted = [...times].sort((x, y) => y - x);
-  for (const t of sorted) {
-    const slices = slicesBetween(ctx, a, Math.max(0, t - 0.000001), t + 0.000002);
-    void slices;
-  }
-  // 简化：直接枚举所有交换点，取 before 之前最后一段
-  const breakpoints = new Set<number>([0, before]);
-  for (const id of [lo, hi]) {
-    for (const s of ctx.plans[id].slots) {
-      if (s.onset > -EPS && s.onset < before + EPS) breakpoints.add(quant(s.onset));
-      if (s.end > -EPS && s.end < before + EPS) breakpoints.add(quant(s.end));
-    }
-  }
-  const pts = [...breakpoints].sort((x, y) => x - y);
-  for (let i = pts.length - 1; i >= 1; i--) {
-    const end = pts[i];
-    const start = pts[i - 1];
-    if (end - start <= EPS) continue;
-    if (end > before + EPS) continue;
-    const mid = (start + end) / 2;
-    const loSlot = slotAt(ctx, a, lo, mid);
-    const hiSlot = slotAt(ctx, a, hi, mid);
-    if (loSlot === null || hiSlot === null) continue;
-    const lp = a.pitch.get(noteKey(lo, loSlot))!;
-    const hp = a.pitch.get(noteKey(hi, hiSlot))!;
-    const info = intervalInfo(lp, hp, ctx.rules.fourthConsonant);
-    return {
-      lower: lo,
-      upper: hi,
-      lowerSlot: loSlot,
-      upperSlot: hiSlot,
-      lowerPitch: lp,
-      upperPitch: hp,
-      simple: info.simple,
-      perfect: isPerfectInterval(lp, hp, ctx.rules.fourthConsonant),
-      quality: info.quality,
-      intervalLabel: info.label,
-      from: start,
-      to: end,
-    };
-  }
-  return null;
-}
-
-function slotAt(ctx: AnalysisContext, a: Assignment, voice: VoiceId, time: number): number | null {
-  const slots = ctx.plans[voice].slots;
-  for (let i = 0; i < slots.length; i++) {
-    const s = slots[i];
-    if (s.onset <= time + EPS && s.end > time + EPS && a.pitch.has(noteKey(voice, i))) return i;
-  }
-  return null;
 }
 
 export function dedupe(vs: Violation[]): Violation[] {

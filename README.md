@@ -19,15 +19,18 @@ npm run dev
 
 | 区域 | 作用 |
 | --- | --- |
-| 左栏「定旋律与节奏」 | 输入定旋律、选择对位声部节奏与音域、设置解数上限，点击 **搜索两条对位声部** |
+| 左栏「定旋律与节奏」 | 输入定旋律、选择对位声部节奏与音域、设置解数上限，点击 **搜索两条对位声部**；可勾选「排练器反向否决」 |
 | 左栏「规则范围」 | 勾选/取消每条规则；切换跨小节历史策略；规则右侧显示本次搜索中该规则触发的剪枝次数 |
 | 中栏「可编辑乐谱」 | 三声部纵向对齐谱；拖动音符上下改音高、左右改起始；点击音符查看该时刻 |
-| 中栏「多轨试听」 | WebAudio 实时合成三条声部，支持静音/独奏/节拍器/导出 WAV |
+| 中栏「多轨试听」 | WebAudio 实时合成三条声部，支持静音/独奏/节拍器/导出 WAV；多轨异常会在此处标出 |
+| 中栏「分谱 · 排练」 | 按声部音域派给歌手，列出换气、换人、每位歌手实际唱到的音，并核对**悬挂音由哪位歌手完成** |
 | 中栏「搜索结果」 | 可选解列表、每个解的逐音与违例、**搜索剪枝**分布与轨迹、**历史策略对比** |
 | 右栏「逐时刻检查」 | 违例列表（点击定位）、逐时刻纵向音程表、可解释不协和（经过/辅助/延留）的说明 |
+| 顶栏状态 | 常显「对位搜索」运行状态（尚未运行 / 运行中 / 完成），与应用内的搜索交互同步 |
 
 按钮「搜索两条对位声部」「采用该解」「运行两种历史策略并比较」都直接调用 `src/core/search.ts`
-中的搜索实现；结果区的音符、违例、统计与试听全部来自这次真实搜索，没有任何固定数据冒充。
+中的搜索实现；结果区的音符、违例、统计、分谱与试听全部来自这次真实搜索，没有任何固定数据冒充。
+对位搜索的交互始终在编曲试听界面内完成，命令行只是辅助入口，不替代界面交互。
 
 ---
 
@@ -41,11 +44,12 @@ npm run cli -- --cf "C3:4 D3:4 E3:4 C3:4" --max-solutions 5
 npm run cli -- --example cross-bar-suspension --compare-history
 npm run cli -- --cf "C3:4 B2:4" --rhythm-u2 sync-a --compare-history --json
 npm run cli -- --cf "C3:4 D3:4" --wav out.wav      # 用第一个解离线渲染 WAV
+npm run cli -- --example cross-bar-suspension --rehearsal   # 导出分谱并核对悬挂歌手
 ```
 
 常用参数：`--cf`、`--example`、`--key`、`--rhythm-u1/--rhythm-u2`、`--range-u1/--range-u2`、
-`--max-solutions`、`--history carry|truncate`、`--compare-history`、`--rules-on/--rules-off`、
-`--json`、`--wav`、`--out`。
+`--max-solutions`、`--history carry|truncate`、`--compare-history`、`--rehearsal`、
+`--rules-on/--rules-off`、`--json`、`--wav`、`--out`。
 
 ---
 
@@ -96,6 +100,42 @@ npm run cli -- --cf "C3:4 D3:4" --wav out.wav      # 用第一个解离线渲染
 每条声部独立满足：音域、调内音、最大跳进、禁三全音、跳进后反向级进恢复、禁同音重复。
 这些规则与纵向规则在同一 `checkSlot` 中判定，搜索剪枝与最终解释完全一致。
 
+### 规则求解分离：可独立检查的模块
+
+规则求解被拆成边界清晰、可单独测试的模块，外部可见的搜索行为保持不变：
+
+- **音程规则** `src/core/intervalRules.ts`：只看两个音，返回可解释的音程证据（协和/纯音程、
+  平行/直接五八度判定）。不含乐谱状态。
+- **声部时间重叠** `src/core/voiceOverlap.ts`：按实际发声起止点切片，`slicesBetween` 等函数
+  只依赖计划与分配，供 `analyze` 与 `suspensions` 共用。
+- **搜索策略** `src/core/searchStrategy.ts`：节奏槽任务、候选代价、事件边界与历史推进，
+  以及“延留义务如何跨节点”的两种策略。
+- **规则证据** `src/core/ruleEvidence.ts`：把证据拆成**即时违例**（`immediate`）与**待解决**
+  （`pending` / `unresolved`）两类，`reportAssignmentEvidence` 汇总后，界面与穷举核对使用同一份证据。
+- **排练器** `src/core/rehearsal.ts`：歌手编制、换气、换人、分谱，以及跨小节反向否决。
+
+原入口 `src/core/search.ts` 仍导出原来的类型与辅助函数作为**兼容适配层**，调用方无需改写；
+`bin/cp-search.ts` 与界面都改接到重构后的模块。
+
+### 延留义务：带入搜索节点还是由约束器收集
+
+搜索期是否把延留义务累积进节点状态（`carry-node`），还是每次从当前分配重新收集
+（`collector`），是一个**实测**问题。两种策略在错开时值、强弱拍、跨小节与延留密集的配置下
+（carry/truncate 两种历史策略）得到**相同的节点数、剪枝数与解集合**，因此默认采用无状态的
+`collector`（`obligationModeDefault()`）；调用方仍可通过 `obligationMode` 显式覆盖。
+
+### 规则证据不伪报：跨小节二声部穷举
+
+`tests/interface.test.ts` 对一个两小节、两声部的定旋律做**穷举**：枚举所有可唱音组合，
+构造乐谱与分配，再用 `reportAssignmentEvidence` 求即时违例与未解决的延留。
+断言中：
+
+- 只有当“即时违例为空 **且** 无未解决延留”时才算接受——接口不会在悬挂音仍未解决时提前接受；
+- 排练器的反向否决只会删除“解决音超出解决歌手音域”的候选，**不会**误删可唱的解。
+
+同一测试文件还覆盖：音程规则与声部重叠模块的独立行为、两种延留义务策略的等价性，
+以及排练器的换气/换人/分谱/跨小节否决。
+
 ---
 
 ## 规则清单
@@ -138,22 +178,35 @@ npm run build     # tsc --noEmit + vite build
 - 经过音/辅助音被解释，而不是被强拍规则直接判错；
 - 搜索结果不是定旋律的平移（相邻音偏移量不唯一）；
 - 规则冲突时返回“无解”，不伪造解；
-- 跨小节历史策略产生“仅一种策略成立”的解。
+- 跨小节历史策略产生“仅一种策略成立”的解；
+- 规则证据分离后，即时违例与待解决延留分别可见，跨小节二声部穷举下不会提前接受悬挂音；
+- 两种延留义务策略（带入节点 vs 约束器收集）在对称配置下给出相同的节点数与解集合；
+- 排练器的反向否决只删除解决音不可唱的候选；
+- 界面内的搜索按钮、多轨试听、分谱面板保持接线，运行状态可见（`tests/app.test.tsx`、`tests/ui.test.tsx`）。
 
 ---
 
 ## 目录
 
 ```
-src/core/pitch.ts     音高、音阶、音程、拍点强弱
-src/core/score.ts     乐谱模型、时间轴、逐时刻报告
-src/core/plan.ts      节奏槽、事件点、旋律解析
-src/core/analyze.ts   重叠区间切片、上下文不协和判定、规则校验、历史
-src/core/search.ts    约束搜索、剪枝、解集比较
-src/core/rules.ts     规则元数据、默认值、谱例与预设
-src/core/examples.ts  谱例构建、诊断、下标陷阱、语义历史比较
-src/audio/synth.ts    WebAudio 多轨合成与 WAV 渲染
-src/components/*      RulePanel / SearchPanel / ScoreEditor / Player
-bin/cp-search.ts      命令行辅助入口
-tests/core.test.ts    核心测试
+src/core/pitch.ts          音高、音阶、音程、拍点强弱
+src/core/score.ts          乐谱模型、时间轴、逐时刻报告
+src/core/plan.ts           节奏槽、事件点、旋律解析
+src/core/intervalRules.ts  音程规则与证据（独立可测）
+src/core/voiceOverlap.ts   声部时间重叠切片（独立可测）
+src/core/suspensions.ts    延留义务的检测与收集
+src/core/searchStrategy.ts 搜索策略：任务、代价、历史推进、义务模式
+src/core/ruleEvidence.ts   即时违例 vs 待解决证据的汇总
+src/core/analyze.ts        上下文不协和判定、规则校验、历史
+src/core/search.ts         约束搜索、剪枝、解集比较（兼容旧入口）
+src/core/rehearsal.ts      排练器：换气、换人、分谱、跨小节反向否决
+src/core/rules.ts          规则元数据、默认值、谱例与预设
+src/core/examples.ts       谱例构建、诊断、下标陷阱、语义历史比较
+src/audio/synth.ts         WebAudio 多轨合成与 WAV 渲染
+src/components/*           RulePanel / SearchPanel / ScoreEditor / Player / RehearsalPanel
+bin/cp-search.ts           命令行辅助入口（不替代界面搜索交互）
+tests/core.test.ts         核心测试
+tests/interface.test.ts    模块接口、证据分离、穷举核对、排练器
+tests/app.test.tsx         界面内搜索交互与试听/分谱接线
+tests/ui.test.tsx          分谱面板组件测试
 ```

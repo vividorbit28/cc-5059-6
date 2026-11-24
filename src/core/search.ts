@@ -1,35 +1,48 @@
-import { midiToName, scalePitchesInRange, isPerfectInterval, intervalInfo, isInScale } from './pitch.js';
+import { midiToName, scalePitchesInRange, isPerfectInterval, isInScale } from './pitch.js';
 import type { Note, VoiceId } from './score.js';
 import {
   analyzeAssignment,
   assignmentToNotes,
   checkSlot,
   classifyDissonance,
-  effectiveContext,
   emptyAssignment,
-  intervalIsDissonant,
   slicesBetween,
-  strengthOf,
   type AnalysisContext,
   type Assignment,
   type DissonanceKind,
   type RuleKey,
   type SuspensionObligation,
   type Violation,
-  historyAt,
   suspensionObligations,
   checkSuspensionResolutions,
   type HistoryBoundary,
 } from './analyze.js';
 import {
-  buildSearchPlans,
-  EPS,
-  feq,
-  noteKey,
-  quant,
-  type VoicePlan,
-} from './plan.js';
+  collectObligations as collectObligationsRaw,
+  detectStrikes,
+  detectStrikesOnExisting,
+  obligationErrors,
+} from './suspensions.js';
+import {
+  advanceHistory,
+  buildTasks,
+  candidateCost,
+  isEventBoundary,
+  obligationModeDefault,
+  type ObligationMode,
+  type StrategyState,
+  type Task,
+} from './searchStrategy.js';
+import { buildSearchPlans, EPS, noteKey, type VoicePlan } from './plan.js';
 import type { CounterpointRules, HistoryPolicy, RhythmSpec, VoiceRangeConfig } from './rules.js';
+import {
+  crossBarVetoes,
+  scoreForRehearsal,
+  type RehearsalConfig,
+} from './rehearsal.js';
+
+export { detectStrikes, detectStrikesOnExisting, obligationErrors };
+export type { ObligationMode };
 
 export interface SearchInput {
   key: AnalysisContext['key'];
@@ -44,6 +57,13 @@ export interface SearchInput {
   maxSolutions?: number;
   maxNodes?: number;
   timeBudgetMs?: number;
+  /** 延留义务跨节点方式；默认由实测决定，调用方可显式覆盖。 */
+  obligationMode?: ObligationMode;
+  /**
+   * 排练器：给定歌手与换气/换人安排后，跨小节换人可反过来否决
+   * 上小节产生的候选（例如新歌手唱不到延留音的解决音）。缺省时不启用。
+   */
+  rehearsal?: RehearsalConfig;
 }
 
 export interface PruneEvent {
@@ -137,39 +157,6 @@ function domainOf(
   return out;
 }
 
-/** 候选排序：优先级进、优先与定旋律协和，保证前几个解具有可听性。 */
-function candidateCost(
-  ctx: AnalysisContext,
-  a: Assignment,
-  voice: VoiceId,
-  slot: number,
-  pitch: number,
-  prevPitch: number | undefined,
-): number {
-  let cost = 0;
-  if (prevPitch !== undefined) cost += Math.abs(pitch - prevPitch) * 1.5;
-  const s = ctx.plans[voice].slots[slot];
-  const slices = slicesBetween(ctx, a, s.onset, Math.min(s.end, s.onset + 0.5));
-  for (const sl of slices) {
-    for (const p of sl.pairs) {
-      if (p.lower === voice || p.upper === voice) {
-        if (p.quality === 'imperfect') cost -= 3;
-        else if (p.quality === 'perfect') cost -= 2;
-        else cost += 8;
-      }
-    }
-  }
-  // 与定旋律的开放音程偏好
-  const cf = a.pitch.get(noteKey('cf', activeSlot(ctx, a, 'cf', s.onset)));
-  if (cf !== undefined) {
-    const info = intervalInfo(cf, pitch, ctx.rules.fourthConsonant);
-    if (info.quality === 'imperfect') cost -= 2;
-    if (info.quality === 'perfect') cost -= 1;
-    if (info.quality === 'dissonant') cost += 6;
-  }
-  return cost;
-}
-
 function activeSlot(
   ctx: AnalysisContext,
   a: Assignment,
@@ -184,56 +171,20 @@ function activeSlot(
   return 0;
 }
 
-interface Task {
-  voice: VoiceId;
-  slot: number;
-}
-
-function buildTasks(plans: Record<'cf' | 'u1' | 'u2', VoicePlan>): Task[] {
-  const tasks: Task[] = [];
-  const order: VoiceId[] = ['u1', 'u2'];
-  for (const voice of order) {
-    for (let i = 0; i < plans[voice].slots.length; i++) {
-      tasks.push({ voice, slot: i });
-    }
-  }
-  tasks.sort((x, y) => {
-    const ox = plans[x.voice].slots[x.slot].onset;
-    const oy = plans[y.voice].slots[y.slot].onset;
-    if (Math.abs(ox - oy) > EPS) return ox - oy;
-    return order.indexOf(x.voice) - order.indexOf(y.voice);
-  });
-  return tasks;
-}
-
-interface DfsState {
-  assignment: Assignment;
-  obligations: SuspensionObligation[];
-  historyTrail: HistoryBoundary[];
-}
+type DfsState = StrategyState;
 
 /**
- * 在事件边界推进历史。carry 保留跨小节开放义务与最后音程；
- * truncate 在小节线丢弃此前义务，只保留本小节内的音程。
+ * 约束器收集：从当前分配重算仍开放的延留义务，而不是在节点里累加。
+ * frontier 取下一个待处理槽位的起始时间，因此“已到解决位置”的义务
+ * 会自动从挂起集合中消失，交由 obligationErrors 在解决音上核验。
  */
-function advanceHistory(
+function collectObligations(
   ctx: AnalysisContext,
   a: Assignment,
-  state: DfsState,
-  time: number,
   policy: HistoryPolicy,
-): HistoryBoundary {
-  const barStart = Math.floor((time + EPS) / ctx.beatsPerMeasure) * ctx.beatsPerMeasure;
-  const floor = policy === 'carry' ? 0 : barStart;
-  const kept =
-    policy === 'carry'
-      ? state.obligations.filter((o) => o.end > time - EPS)
-      : state.obligations.filter((o) => o.end > time - EPS && o.onset >= floor - EPS);
-  state.obligations = kept;
-  const slices = slicesBetween(ctx, a, Math.max(0, time - 0.0001), time);
-  let pairs = slices.flatMap((s) => s.pairs).slice(-4);
-  const h: HistoryBoundary = { pairs, obligations: kept.map((o) => ({ ...o })), time };
-  return h;
+  frontier: number,
+): SuspensionObligation[] {
+  return collectObligationsRaw(ctx, a, policy, frontier);
 }
 
 export function search(input: SearchInput): SearchResult {
@@ -243,6 +194,7 @@ export function search(input: SearchInput): SearchResult {
   const timeBudget = input.timeBudgetMs ?? 2500;
   const { plans, T } = buildSearchPlans(input.cfNotes, input.u1, input.u2, input.rhythmU1, input.rhythmU2);
   const ctx = makeContext(plans, T, input, false);
+  const obligationMode = input.obligationMode ?? obligationModeDefault();
 
   if (T <= EPS) {
     return {
@@ -313,6 +265,38 @@ export function search(input: SearchInput): SearchResult {
       stats.pruned.duplicate = (stats.pruned.duplicate ?? 0) + 1;
       return;
     }
+
+    // 排练器反向否决：下一小节换人后，上小节延留音的解决音是否仍可唱。
+    if (input.rehearsal) {
+      const score = scoreForRehearsal(
+        input.cfNotes,
+        assignmentToNotes(finalCtx, state.assignment, 'u1', plans.u1.name),
+        assignmentToNotes(finalCtx, state.assignment, 'u2', plans.u2.name),
+        {
+          key: input.key,
+          beatsPerMeasure: input.beatsPerMeasure,
+          ranges: { cf: { low: 24, high: 84, name: 'cf' }, u1: input.u1, u2: input.u2 },
+        },
+      );
+      const vetoes = crossBarVetoes(score, input.rehearsal, input.rules);
+      if (vetoes.length > 0) {
+        stats.pruned.rehearsalRange = (stats.pruned.rehearsalRange ?? 0) + 1;
+        if (stats.traces.length < 80) {
+          stats.traces.push({
+            voice: vetoes[0].voice,
+            slot: vetoes[0].upstreamSlot,
+            onset: vetoes[0].upstreamOnset,
+            pitch: vetoes[0].pitch,
+            rule: 'rehearsalRange',
+            message: vetoes[0].message,
+            detail: '排练器否决：下一小节换人后解决音不可唱，反向否决上小节候选。',
+            time: vetoes[0].resolveTime,
+          });
+        }
+        return;
+      }
+    }
+
     seen.add(sig);
     const u1 = assignmentToNotes(finalCtx, state.assignment, 'u1', plans.u1.name);
     const u2 = assignmentToNotes(finalCtx, state.assignment, 'u2', plans.u2.name);
@@ -481,9 +465,13 @@ export function search(input: SearchInput): SearchResult {
       // 推进历史（跨小节时刻）
       const prevTrail = state.historyTrail;
       const prevObs = state.obligations;
+      const carriedObligations =
+        obligationMode === 'collector'
+          ? collectObligations(ctx, trial, input.historyPolicy, s.end)
+          : [...prevObs, ...newObligations];
       const trialState: DfsState = {
         assignment: trial,
-        obligations: [...prevObs, ...newObligations],
+        obligations: carriedObligations,
         historyTrail: prevTrail,
       };
       const boundaryTime = s.end;
@@ -566,18 +554,6 @@ function emptyStats(): SearchStats {
   };
 }
 
-function isEventBoundary(
-  ctx: AnalysisContext,
-  time: number,
-  tasks: Task[],
-  index: number,
-): boolean {
-  if (index + 1 >= tasks.length) return false; // 曲末不是“下一步”，无需携带历史
-  const next = tasks[index + 1];
-  const nextOnset = ctx.plans[next.voice].slots[next.slot].onset;
-  return nextOnset > time + EPS;
-}
-
 function signatureOf(
   plans: Record<'cf' | 'u1' | 'u2', VoicePlan>,
   a: Assignment,
@@ -602,141 +578,6 @@ function melodyScore(notes: Note[]): number {
     else score += d * 2;
   }
   return score;
-}
-
-/**
- * 延留义务：若本音在某个持续音上造成新的不协和，且该持续音此前
- * 与移动声部协和（有准备），则为持续音建立“必须下行级进解决”的义务。
- * 仅对 u1/u2 的上方持续音建立，范围明确。
- */
-export function detectStrikes(
-  ctx: AnalysisContext,
-  a: Assignment,
-  voice: VoiceId,
-  slot: number,
-  pitch: number,
-  policy: HistoryPolicy,
-): SuspensionObligation[] {
-  const out: SuspensionObligation[] = [];
-  const s = ctx.plans[voice].slots[slot];
-  const slices = slicesBetween(ctx, a, s.onset, s.end);
-  if (slices.length === 0) return out;
-  const first = slices[0];
-  for (const v of ['u1', 'u2'] as VoiceId[]) {
-    if (v === voice) continue;
-    const held = first.active[v];
-    if (!held) continue;
-    const heldSlot = ctx.plans[v].slots[held.slot];
-    if (!heldSlot) continue;
-    if (!(heldSlot.onset < s.onset - EPS)) continue; // 必须是先前已在响的音
-    if (policy === 'truncate') {
-      const barStart = Math.floor((s.onset + EPS) / ctx.beatsPerMeasure) * ctx.beatsPerMeasure;
-      if (heldSlot.onset < barStart - EPS) continue;
-    }
-    if (!intervalIsDissonant(pitch, held.pitch, ctx.rules.fourthConsonant)) continue;
-    // 有准备：移动声部的前一个音与该持续音协和（或该声部从此开始）。
-    const prev = a.pitch.get(noteKey(voice, slot - 1));
-    const prepared =
-      prev === undefined || !intervalIsDissonant(prev, held.pitch, ctx.rules.fourthConsonant);
-    if (!prepared) continue;
-    // 持续音必须是纵向上的上方音（学校对位中的上方延留）。
-    if (held.pitch <= pitch) continue;
-    out.push({
-      voice: v,
-      slot: held.slot,
-      onset: heldSlot.onset,
-      end: heldSlot.end,
-      pitch: held.pitch,
-      struckBy: { voice, slot, time: s.onset, pitch },
-    });
-  }
-  return out;
-}
-
-/** 检查本音是否履行了此前延留义务（下行级进解决）。 */
-export function obligationErrors(
-  ctx: AnalysisContext,
-  a: Assignment,
-  voice: VoiceId,
-  slot: number,
-  pitch: number,
-  policy: HistoryPolicy,
-): Violation[] {
-  const out: Violation[] = [];
-  const s = ctx.plans[voice].slots[slot];
-  if (slot === 0) return out;
-  const prevPitch = a.pitch.get(noteKey(voice, slot - 1));
-  if (prevPitch === undefined) return out;
-  const prevSlot = ctx.plans[voice].slots[slot - 1];
-  if (!feq(prevSlot.end, s.onset)) return out;
-  if (policy === 'truncate') {
-    const barStart = Math.floor((s.onset + EPS) / ctx.beatsPerMeasure) * ctx.beatsPerMeasure;
-    if (prevSlot.onset < barStart - EPS) return out;
-  }
-  // 前一个音是否在它自己的时值内被撞成不协和？
-  const strikes = detectStrikesOnExisting(ctx, a, voice, slot - 1, policy);
-  if (strikes.length === 0) return out;
-  if (ctx.rules.suspensionResolveDown) {
-    const down = Math.sign(pitch - prevPitch) < 0;
-    const step = Math.abs(pitch - prevPitch) <= 2;
-    if (!(down && step)) {
-      out.push({
-        rule: 'suspensionResolveDown',
-        ruleLabel: '延留音下行解决',
-        severity: 'error',
-        time: s.onset,
-        measure: Math.floor(s.onset / ctx.beatsPerMeasure + 1e-9),
-        beat: ((s.onset % ctx.beatsPerMeasure) + ctx.beatsPerMeasure) % ctx.beatsPerMeasure,
-        strength: strengthOf(ctx, s.onset),
-        voices: [voice],
-        message: `${voice} 的延留音 ${midiToName(prevPitch)} 未下行级进解决，而是到 ${midiToName(pitch)}。`,
-        detail: '延留音必须在结束时下行级进（≤2 半音）解决；该义务跨小节保留。',
-        notes: [
-          { voice, index: slot - 1 },
-          { voice, index: slot },
-        ],
-      });
-    }
-  }
-  return out;
-}
-
-/**
- * 判断某声部的某个已给音在其时值内是否被其他声部撞成不协和。
- * 用于搜索中检查上一个音是否成了延留音。
- */
-export function detectStrikesOnExisting(
-  ctx: AnalysisContext,
-  a: Assignment,
-  voice: VoiceId,
-  slot: number,
-  policy: HistoryPolicy,
-): { time: number; by: VoiceId }[] {
-  const note = ctx.plans[voice].slots[slot];
-  if (!note) return [];
-  const slices = slicesBetween(ctx, a, note.onset, note.end);
-  const out: { time: number; by: VoiceId }[] = [];
-  for (const sl of slices) {
-    if (sl.from <= note.onset + EPS) continue;
-    const self = sl.active[voice];
-    if (!self) continue;
-    for (const other of ['cf', 'u1', 'u2'] as VoiceId[]) {
-      if (other === voice) continue;
-      const o = sl.active[other];
-      if (!o) continue;
-      const os = ctx.plans[other].slots[o.slot];
-      if (!os || Math.abs(os.onset - sl.from) > EPS) continue; // 只有他声部进入才构成“撞”
-      if (policy === 'truncate') {
-        const barStart = Math.floor((sl.from + EPS) / ctx.beatsPerMeasure) * ctx.beatsPerMeasure;
-        if (note.onset < barStart - EPS) continue;
-      }
-      if (intervalIsDissonant(self.pitch, o.pitch, ctx.rules.fourthConsonant)) {
-        // 该音必须是上方音
-        if (self.pitch > o.pitch) out.push({ time: sl.from, by: other });
-      }
-    }
-  }
-  return out;
 }
 
 function pickDiverse(solutions: SearchSolution[], k: number): SearchSolution[] {

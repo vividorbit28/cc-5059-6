@@ -29,11 +29,18 @@ import {
 } from './core/examples.js';
 import { parseMelody } from './core/plan.js';
 import { search, type SearchResult, type SearchSolution } from './core/search.js';
+import {
+  defaultRosters,
+  planRehearsal,
+  rehearsalAnomalyGroups,
+  type RehearsalConfig,
+} from './core/rehearsal.js';
 import { makeVoice, type Note, type Score, type VoiceId } from './core/score.js';
 import { ScoreEditor } from './components/ScoreEditor.js';
 import { RulePanel } from './components/RulePanel.js';
 import { SearchPanel, ViolationList } from './components/SearchPanel.js';
 import { Player } from './components/Player.js';
+import { RehearsalPanel } from './components/RehearsalPanel.js';
 
 const INITIAL_EXAMPLE = EXAMPLES.find((e) => e.id === 'feasible')!;
 
@@ -50,6 +57,8 @@ export default function App() {
   const [u1Range, setU1Range] = useState(DEFAULT_VOICES.u1);
   const [u2Range, setU2Range] = useState(DEFAULT_VOICES.u2);
   const [maxSolutions, setMaxSolutions] = useState(10);
+  // 是否启用“排练器反向否决”：把歌手的可唱音域作为搜索的额外边界。
+  const [rehearsalVeto, setRehearsalVeto] = useState(true);
 
   const [score, setScore] = useState<Score>(() => buildExample(INITIAL_EXAMPLE).score);
   const [diagnosis, setDiagnosis] = useState<ExampleDiagnosis | null>(null);
@@ -81,6 +90,28 @@ export default function App() {
   const rhythmU2 = useMemo(
     () => RHYTHM_PRESETS.find((r) => r.id === rhythmU2Id)?.spec ?? ({ kind: 'fixed', duration: 2 } as RhythmSpec),
     [rhythmU2Id],
+  );
+
+  // 排练编制：按当前声部音域生成歌手，供分谱与搜索反向否决共用。
+  const rehearsalRanges = useMemo(
+    () => ({
+      cf: { low: score.voices.cf.low, high: score.voices.cf.high, name: '定旋律' },
+      u1: { low: u1Range.low, high: u1Range.high, name: u1Range.name },
+      u2: { low: u2Range.low, high: u2Range.high, name: u2Range.name },
+    }),
+    [score.voices.cf.low, score.voices.cf.high, u1Range, u2Range],
+  );
+  const rehearsalConfig = useMemo<RehearsalConfig>(
+    () => defaultRosters(rehearsalRanges, 4),
+    [rehearsalRanges],
+  );
+  const rehearsalPlan = useMemo(
+    () => planRehearsal(score, rehearsalConfig, rules),
+    [score, rehearsalConfig, rules],
+  );
+  const rehearsalAnomalies = useMemo(
+    () => rehearsalAnomalyGroups(rehearsalPlan),
+    [rehearsalPlan],
   );
 
   // 手动编辑后重新诊断（不重新搜索）。
@@ -118,6 +149,7 @@ export default function App() {
           maxSolutions,
           maxNodes: 160000,
           timeBudgetMs: 5000,
+          rehearsal: rehearsalVeto ? rehearsalConfig : undefined,
         });
         setResult(res);
         setSelectedSolutionId(res.solutions[0]?.id ?? null);
@@ -148,7 +180,7 @@ export default function App() {
         setSearching(false);
       }
     }, 20);
-  }, [cfParsed, key, rules, historyPolicy, u1Range, u2Range, rhythmU1, rhythmU2, maxSolutions, score.tempo]);
+  }, [cfParsed, key, rules, historyPolicy, u1Range, u2Range, rhythmU1, rhythmU2, maxSolutions, score.tempo, rehearsalVeto, rehearsalConfig]);
 
   const adoptSolution = (sol: SearchSolution) => {
     const s = scoreFromSolution(cfParsed.notes, sol, {
@@ -259,6 +291,16 @@ export default function App() {
           </p>
         </div>
         <div className="top-actions">
+          <span
+            className={`search-state ${searching ? 'busy' : result ? 'done' : 'idle'}`}
+            aria-live="polite"
+          >
+            {searching
+              ? '对位搜索运行中…'
+              : result
+                ? `对位搜索完成 · ${result.solutions.length} 条解`
+                : '尚未运行对位搜索'}
+          </span>
           <button className="secondary" onClick={() => setShowExamples((v) => !v)}>
             {showExamples ? '收起谱例' : '打开谱例与演示'}
           </button>
@@ -361,6 +403,15 @@ export default function App() {
               />
             </label>
 
+            <label className="checkbox small">
+              <input
+                type="checkbox"
+                checked={rehearsalVeto}
+                onChange={(e) => setRehearsalVeto(e.target.checked)}
+              />
+              排练器反向否决（下一小节换人后解决音不可唱则否决上小节候选）
+            </label>
+
             <button className="primary wide" onClick={runSearch} disabled={searching}>
               {searching ? '搜索中…' : '搜索两条对位声部'}
             </button>
@@ -415,8 +466,16 @@ export default function App() {
                 三条声部由 WebAudio 实时合成，内容直接来自左侧“可编辑乐谱”。
               </span>
             </header>
+            {rehearsalAnomalies.playbackIssues.length > 0 && (
+              <div className="callout warn">
+                多轨试听异常 {rehearsalAnomalies.playbackIssues.length} 处：
+                {rehearsalAnomalies.playbackIssues.map((a) => a.message).join('；')}
+              </div>
+            )}
             <Player score={score} onPlayhead={setPlayhead} />
           </section>
+
+          <RehearsalPanel plan={rehearsalPlan} score={score} />
 
           <SearchPanel
             result={result}
